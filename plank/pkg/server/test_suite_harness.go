@@ -12,7 +12,7 @@ import (
 	"github.com/vmware/transport-go/bus"
 	"github.com/vmware/transport-go/model"
 	"github.com/vmware/transport-go/plank/utils"
-	"github.com/vmware/transport-go/service"
+	svc "github.com/vmware/transport-go/service"
 	"io/ioutil"
 	"net"
 	"os"
@@ -81,7 +81,7 @@ func GetBasicTestServerConfig(rootDir, outLog, accessLog, errLog string, port in
 
 // SetupPlankTestSuite will boot a new instance of plank on your chosen port and will also fire up your service
 // Ready to be tested. This always runs on localhost.
-func SetupPlankTestSuite(service service.FabricService, serviceChannel string, port int,
+func SetupPlankTestSuite(service svc.FabricService, serviceChannel string, port int,
 	config *PlatformServerConfig) (*PlankIntegrationTestSuite, error) {
 
 	s := &PlankIntegrationTestSuite{}
@@ -103,7 +103,8 @@ func SetupPlankTestSuite(service service.FabricService, serviceChannel string, p
 	s.Syschan = make(chan os.Signal, 1)
 	go s.PlatformServer.StartServer(s.Syschan)
 
-	s.EventBus = bus.GetBus()
+	s.EventBus = bus.ResetBus()
+	svc.ResetServiceRegistry()
 
 	// get a pointer to the channel manager
 	s.ChannelManager = s.EventBus.GetChannelManager()
@@ -171,6 +172,35 @@ func GetTestPort() int {
 	}
 
 	return testSuitePortMap[fr.File]
+}
+
+// GetTestTLSCertConfig returns a new &TLSCertConfig for testing.
+func GetTestTLSCertConfig(testRootPath string) *TLSCertConfig {
+	crtFile := filepath.Join(testRootPath, "test_server.crt")
+	keyFile := filepath.Join(testRootPath, "test_server.key")
+	_ = ioutil.WriteFile(crtFile, []byte(testServerCertTmpl), 0700)
+	_ = ioutil.WriteFile(keyFile, []byte(testServerKeyTmpl), 0700)
+	return &TLSCertConfig{
+		CertFile:                  crtFile,
+		KeyFile:                   keyFile,
+		SkipCertificateValidation: true,
+	}
+}
+
+// GetTestFabricBrokerConfig returns a basic fabric broker config.
+func GetTestFabricBrokerConfig() *FabricBrokerConfig {
+	return &FabricBrokerConfig{
+		FabricEndpoint: "/ws",
+		UseTCP:         false,
+		TCPPort:        61613,
+		EndpointConfig: &bus.EndpointConfig{
+			TopicPrefix:           "/topic",
+			UserQueuePrefix:       "/queue",
+			AppRequestPrefix:      "/pub",
+			AppRequestQueuePrefix: "/pub/queue",
+			Heartbeat:             30000,
+		},
+	}
 }
 
 // CreateConfigJsonForTest creates and returns the path to a file containing the plank configuration in JSON format

@@ -9,8 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -22,6 +20,10 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+	"github.com/vmware/transport-go/model"
 
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
@@ -46,6 +48,8 @@ func NewPlatformServer(config *PlatformServerConfig) PlatformServer {
 	ps.serverConfig = config
 	ps.ServerAvailability = &ServerAvailability{}
 	ps.routerConcurrencyProtection = new(int32)
+	ps.messageBridgeMap = make(map[string]*MessageBridge)
+	ps.eventbus = bus.GetBus()
 	ps.initialize()
 	return ps
 }
@@ -73,6 +77,7 @@ func NewPlatformServerFromConfig(configPath string) (PlatformServer, error) {
 	}
 
 	ps := new(platformServer)
+	ps.eventbus = bus.GetBus()
 	sanitizeConfigRootPath(&config)
 
 	// ensure references to file system paths are relative to config.RootDir
@@ -152,21 +157,37 @@ func (ps *platformServer) StartServer(syschan chan os.Signal) {
 		ps.ServerAvailability.Http = true
 		if ps.serverConfig.TLSCertConfig != nil {
 			utils.Log.Infof("[plank] Starting HTTP server at %s:%d with TLS", ps.serverConfig.Host, ps.serverConfig.Port)
-			_ = ps.HttpServer.ListenAndServeTLS(ps.serverConfig.TLSCertConfig.CertFile, ps.serverConfig.TLSCertConfig.KeyFile)
+			if err := ps.HttpServer.ListenAndServeTLS(ps.serverConfig.TLSCertConfig.CertFile, ps.serverConfig.TLSCertConfig.KeyFile); err != nil {
+				if !errors.Is(err, http.ErrServerClosed) {
+					utils.Log.Fatalln(wrapError(errServerInit, err))
+				}
+			}
 		} else {
 			utils.Log.Infof("[plank] Starting HTTP server at %s:%d", ps.serverConfig.Host, ps.serverConfig.Port)
-			_ = ps.HttpServer.ListenAndServe()
+			if err := ps.HttpServer.ListenAndServe(); err != nil {
+				if !errors.Is(err, http.ErrServerClosed) {
+					utils.Log.Fatalln(wrapError(errServerInit, err))
+				}
+			}
 		}
 	}()
 
 	// if Fabric broker configuration is found, start the broker
 	if ps.serverConfig.FabricConfig != nil {
 		go func() {
-			utils.Log.Infof("[plank] Starting Transport broker at %s:%d%s",
-				ps.serverConfig.Host, ps.serverConfig.Port, ps.serverConfig.FabricConfig.FabricEndpoint)
+			fabricPort := ps.serverConfig.Port
+			fabricEndpoint := ps.serverConfig.FabricConfig.FabricEndpoint
+			if ps.serverConfig.FabricConfig.UseTCP {
+				// if using TCP adjust port accordingly and drop endpoint
+				fabricPort = ps.serverConfig.FabricConfig.TCPPort
+				fabricEndpoint = ""
+			}
+			brokerLocation := fmt.Sprintf("%s:%d%s", ps.serverConfig.Host, fabricPort, fabricEndpoint)
+			utils.Log.Infof("[plank] Starting Transport broker at %s", brokerLocation)
 			ps.ServerAvailability.Fabric = true
-			if err := bus.GetBus().StartFabricEndpoint(ps.fabricConn, *ps.serverConfig.FabricConfig.EndpointConfig); err != nil {
-				panic(err)
+
+			if err := ps.eventbus.StartFabricEndpoint(ps.fabricConn, *ps.serverConfig.FabricConfig.EndpointConfig); err != nil {
+				utils.Log.Fatalln(wrapError(errServerInit, err))
 			}
 		}()
 	}
@@ -175,7 +196,7 @@ func (ps *platformServer) StartServer(syschan chan os.Signal) {
 	go func() {
 		<-ps.SyscallChan
 		// notify subscribers that the server is shutting down
-		_ = bus.GetBus().SendResponseMessage(PLANK_SERVER_ONLINE_CHANNEL, false, nil)
+		_ = ps.eventbus.SendResponseMessage(PLANK_SERVER_ONLINE_CHANNEL, false, nil)
 		ps.StopServer()
 		close(connClosed)
 	}()
@@ -190,7 +211,7 @@ func (ps *platformServer) StartServer(syschan chan os.Signal) {
 			utils.Log.Debugln("waiting for http server to be ready to accept connections")
 			continue
 		}
-		_ = bus.GetBus().SendResponseMessage(PLANK_SERVER_ONLINE_CHANNEL, true, nil)
+		_ = ps.eventbus.SendResponseMessage(PLANK_SERVER_ONLINE_CHANNEL, true, nil)
 		break
 	}
 
@@ -242,7 +263,7 @@ func (ps *platformServer) StopServer() {
 	}
 
 	if ps.fabricConn != nil {
-		err = ps.fabricConn.Close()
+		err = ps.eventbus.StopFabricEndpoint()
 		if err != nil {
 			utils.Log.Errorln(err)
 		}
@@ -284,7 +305,7 @@ func (ps *platformServer) RegisterService(svc service.FabricService, svcChannel 
 		var hooks service.ServiceLifecycleHookEnabled
 		if hooks = svcLifecycleManager.GetServiceHooks(svcChannel); hooks == nil {
 			// if service has no lifecycle hooks mark the channel as ready straight up
-			storeManager := bus.GetBus().GetStoreManager()
+			storeManager := ps.eventbus.GetStoreManager()
 			store := storeManager.GetStore(service.ServiceReadyStore)
 			store.Put(svcChannel, true, service.ServiceInitStateChange)
 			utils.Log.Infof("[plank] Service '%s' initialized successfully", svcType.String())
@@ -293,7 +314,7 @@ func (ps *platformServer) RegisterService(svc service.FabricService, svcChannel 
 	return err
 }
 
-// SetHttpChannelBridge establishes a conduit between the the transport service channel and an HTTP endpoint
+// SetHttpChannelBridge establishes a conduit between the transport service channel and an HTTP endpoint
 // that allows a client to invoke the service via REST.
 func (ps *platformServer) SetHttpChannelBridge(bridgeConfig *service.RESTBridgeConfig) {
 	ps.lock.Lock()
@@ -312,11 +333,31 @@ func (ps *platformServer) SetHttpChannelBridge(bridgeConfig *service.RESTBridgeC
 		ps.serviceChanToBridgeEndpoints[bridgeConfig.ServiceChannel] = make([]string, 0)
 	}
 
+	if _, exists := ps.messageBridgeMap[bridgeConfig.ServiceChannel]; !exists {
+		handler, _ := ps.eventbus.ListenStream(bridgeConfig.ServiceChannel)
+		handler.Handle(func(message *model.Message) {
+			ps.messageBridgeMap[bridgeConfig.ServiceChannel].payloadChannel <- message
+		}, func(err error) {})
+
+		ps.messageBridgeMap[bridgeConfig.ServiceChannel] = &MessageBridge{
+			ServiceListenStream: handler,
+			payloadChannel:      make(chan *model.Message, 100),
+		}
+	}
+
+	// NOTE: mux.Router does not have mutex or any locking mechanism so it could sometimes lead to concurrency write
+	// panics. the following is to ensure the modification to ps.router can happen only once per thread, this atomic
+	// counter also protects against concurrent writing to ps.endpointHandlerMap
+	for !atomic.CompareAndSwapInt32(ps.routerConcurrencyProtection, 0, 1) {
+		time.Sleep(1 * time.Nanosecond)
+	}
+
 	// build endpoint handler
-	ps.endpointHandlerMap[endpointHandlerKey] = buildEndpointHandler(
+	ps.endpointHandlerMap[endpointHandlerKey] = ps.buildEndpointHandler(
 		bridgeConfig.ServiceChannel,
 		bridgeConfig.FabricRequestBuilder,
-		ps.serverConfig.RestBridgeTimeout)
+		ps.serverConfig.RestBridgeTimeout,
+		ps.messageBridgeMap[bridgeConfig.ServiceChannel].payloadChannel)
 
 	ps.serviceChanToBridgeEndpoints[bridgeConfig.ServiceChannel] = append(
 		ps.serviceChanToBridgeEndpoints[bridgeConfig.ServiceChannel], endpointHandlerKey)
@@ -327,12 +368,6 @@ func (ps *platformServer) SetHttpChannelBridge(bridgeConfig *service.RESTBridgeC
 	}
 	if bridgeConfig.AllowOptions {
 		permittedMethods = append(permittedMethods, http.MethodOptions)
-	}
-
-	// NOTE: mux.Router does not have mutex or any locking mechanism so it could sometimes lead to concurrency write
-	// panics. the following is to ensure the modification to ps.router can happen only once per thread
-	for !atomic.CompareAndSwapInt32(ps.routerConcurrencyProtection, 0, 1) {
-		time.Sleep(1 * time.Nanosecond)
 	}
 
 	ps.router.
@@ -349,7 +384,7 @@ func (ps *platformServer) SetHttpChannelBridge(bridgeConfig *service.RESTBridgeC
 		bridgeConfig.ServiceChannel, bridgeConfig.Uri, bridgeConfig.Method)
 }
 
-// SetHttpPathPrefixChannelBridge establishes a conduit between the the transport service channel and a path prefix
+// SetHttpPathPrefixChannelBridge establishes a conduit between the transport service channel and a path prefix
 // every request on this prefix will be sent through to the target service, all methods, all sub paths, lock, stock and barrel.
 func (ps *platformServer) SetHttpPathPrefixChannelBridge(bridgeConfig *service.RESTBridgeConfig) {
 	ps.lock.Lock()
@@ -368,11 +403,24 @@ func (ps *platformServer) SetHttpPathPrefixChannelBridge(bridgeConfig *service.R
 		ps.serviceChanToBridgeEndpoints[bridgeConfig.ServiceChannel] = make([]string, 0)
 	}
 
+	if _, exists := ps.messageBridgeMap[bridgeConfig.ServiceChannel]; !exists {
+		handler, _ := ps.eventbus.ListenStream(bridgeConfig.ServiceChannel)
+		handler.Handle(func(message *model.Message) {
+			ps.messageBridgeMap[bridgeConfig.ServiceChannel].payloadChannel <- message
+		}, func(err error) {})
+
+		ps.messageBridgeMap[bridgeConfig.ServiceChannel] = &MessageBridge{
+			ServiceListenStream: handler,
+			payloadChannel:      make(chan *model.Message, 100),
+		}
+	}
+
 	// build endpoint handler
-	ps.endpointHandlerMap[endpointHandlerKey] = buildEndpointHandler(
+	ps.endpointHandlerMap[endpointHandlerKey] = ps.buildEndpointHandler(
 		bridgeConfig.ServiceChannel,
 		bridgeConfig.FabricRequestBuilder,
-		ps.serverConfig.RestBridgeTimeout)
+		ps.serverConfig.RestBridgeTimeout,
+		ps.messageBridgeMap[bridgeConfig.ServiceChannel].payloadChannel)
 
 	ps.serviceChanToBridgeEndpoints[bridgeConfig.ServiceChannel] = append(
 		ps.serviceChanToBridgeEndpoints[bridgeConfig.ServiceChannel], endpointHandlerKey)
@@ -491,4 +539,10 @@ func (ps *platformServer) checkPortAvailability() {
 		utils.Log.Fatalf("Server could not start at %s:%d because another process is using it. Please try another endpoint.",
 			ps.serverConfig.Host, ps.serverConfig.Port)
 	}
+}
+
+func (ps *platformServer) setEventBusRef(evtBus bus.EventBus) {
+	ps.lock.Lock()
+	ps.eventbus = evtBus
+	ps.lock.Unlock()
 }
